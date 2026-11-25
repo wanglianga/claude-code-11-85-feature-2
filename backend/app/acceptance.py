@@ -3,7 +3,9 @@
 对应题目验收剧本：
 P1 双药店同日同成分重叠 + 停诊 + 同一给药期；规则与图模型同链；
 P2/P3 弱身份不合并、不扩展；P4 调拨解释合法供药；P5 申诉退回关闭。
+另含病例组合基准三项：未标准化均值差、共同支持失败不外推、小组病例区间。
 """
+import math
 from datetime import date
 
 from sqlalchemy.orm import Session
@@ -11,6 +13,7 @@ from sqlalchemy.orm import Session
 from .models import (
     Appeal, Case, CaseJudgment, GraphEdge, IdentityEvidence, SourceRecord,
 )
+from .services import casemix as cm
 from .services import identity
 from .services.expansion import expand, high_amount_extension
 from .services.ranking import rank_cases
@@ -200,6 +203,105 @@ def run_acceptance(db: Session) -> dict:
          "identity_version": snap1.identity_version if snap1 else None,
          "policies": len(snap1.policy_versions) if snap1 else 0,
          "judgment_version": j1.version, "snapshot_no": j1.snapshot_no}))
+
+    # ============================================================
+    # 病例组合基准（case-mix）三项核验
+    # ============================================================
+    # 11) 未经标准化的总均值差：病例结构差异被误读为费用异常 ----------------
+    unstd = cm.unstandardized(db)
+    raw = unstd["core"]["by_org"]
+    h6_raw, h7_raw = raw.get("H6"), raw.get("H7")
+    raw_diff = unstd["core"]["mean_diff"]
+    direct = cm.direct_standardization(db)
+    d_rows = {r["org_code"]: r for r in direct["orgs"]}
+    d6, d7 = d_rows.get("H6"), d_rows.get("H7")
+    # 标准化后：同组参考均值完全一致 → 残差≈0、观察值落区间内
+    std_ok = (
+        h6_raw and h7_raw
+        and h6_raw["episodes"] == 100 and h7_raw["episodes"] == 100
+        and h6_raw["mean_amount"] == 6000.0 and h7_raw["mean_amount"] == 4000.0
+        and raw_diff == 2000.0
+        and d6 and d7
+        and abs(d6["residual"]["total_amount"]) < 1.0
+        and abs(d7["residual"]["total_amount"]) < 1.0
+        and d6["residual"]["within_interval"] and d7["residual"]["within_interval"]
+    )
+    checks.append(_chk(
+        "casemix_raw_vs_standardized",
+        "病例组合：未标准化人均差 2000 元（重症60%vs20%），标准化后残差≈0",
+        std_ok,
+        "原始人均 H6=6000/H7=4000（差2000）；直接标准化两机构残差均≈0且在期望区间内",
+        {"raw_H6": h6_raw and h6_raw["mean_amount"],
+         "raw_H7": h7_raw and h7_raw["mean_amount"], "raw_diff": raw_diff,
+         "std_residual_H6": d6 and d6["residual"]["total_amount"],
+         "std_residual_H7": d7 and d7["residual"]["total_amount"],
+         "expected_H6": d6 and d6["expected"]["total_amount"],
+         "observed_H6": d6 and d6["observed"]["total_amount"]}))
+
+    # 12) 共同支持失败：未覆盖/单机构病例禁止外推 --------------------------
+    layers = cm.stratify(db)
+    fail_groups = {f["group_code"] for f in layers["common_support_failures"]}
+    uncovered_codes = {u["episode"] for u in layers["uncovered"]}
+    gates = cm.gate_decisions(db)
+    gated_episodes = {c for g in gates for c in g["episodes"]}
+    # 直接标准化：罕见组不得出现在 supported_groups
+    # 匹配路线：同样必须拒绝外推
+    matching = cm.matching_standardization(db)
+    m_excluded = {x["code"] for r in matching["orgs"] for x in r["excluded_episodes"]}
+    rare_eps = {f"EP-H6-{101 + i:03d}" for i in range(4)}
+    support_ok = (
+        "CG-RARE" in fail_groups
+        and "EP-H7-101" in uncovered_codes
+        and rare_eps <= gated_episodes and "EP-H7-101" in gated_episodes
+        and "CG-RARE" not in direct["supported_groups"]
+        and all(x in gated_episodes for x in rare_eps | {"EP-H7-101"})
+        and rare_eps <= m_excluded and "EP-H7-101" in m_excluded
+    )
+    checks.append(_chk(
+        "casemix_common_support_gate",
+        "门禁：H6 独有罕见组(4例)与 H7 未覆盖体检例不外推、不判可疑",
+        support_ok,
+        "CG-RARE 共同支持失败、EP-H7-101 未覆盖；两条路线均排除且门禁登记",
+        {"support_failures": sorted(fail_groups),
+         "uncovered": sorted(uncovered_codes),
+         "direct_supported_groups": direct["supported_groups"],
+         "matching_excluded": sorted(m_excluded),
+         "gated": sorted(gated_episodes)}))
+
+    # 13) 小组病例区间：t 分位加宽且不输出可疑判定 -------------------------
+    # 取直接标准化分组明细中带 small_group 标记的单元（H7 重症组 20<30 阈值）
+    small_cells = [b for r in direct["orgs"] for b in r["group_breakdown"]
+                   if b["small_group"]]
+    # 每例区间半宽 = t·SD/√n：样本越少区间越宽（t 分位行为）
+    wide_n, narrow_n = 5, 25
+    wide_half = cm.t_critical(wide_n - 1) * 200.0 / math.sqrt(wide_n)
+    narrow_half = cm.t_critical(narrow_n - 1) * 200.0 / math.sqrt(narrow_n)
+    # 共同支持失败的罕见组在主结果中必须整体排除（不产生任何期望区间）
+    rare_in_breakdown = [b for r in direct["orgs"] for b in r["group_breakdown"]
+                         if b["group_code"] == "CG-RARE"]
+    # 匹配路线对被支持的主样本机构结果：区间为有限正数、且残差标记不是可疑
+    flags = {r["org_code"]: r["residual"]["flag"] for r in matching["orgs"]}
+    small_ok = (
+        cm.t_critical(4) > cm.t_critical(24) > 1.96
+        and wide_half > narrow_half
+        and not rare_in_breakdown
+        and len(small_cells) >= 1
+        and all(f != "out_of_interval_review" for f in flags.values())
+        and all(g["action"] for g in gates)
+    )
+    checks.append(_chk(
+        "casemix_small_group_interval",
+        "小组病例：t 分位区间随小样本加宽；共同支持失败组不产生区间、不判可疑",
+        small_ok,
+        "t(4)>t(24)>1.96；每例半宽 n=5 宽于 n=25；CG-RARE 无区间；H7 重症组标小组；无可疑标记",
+        {"t_df4": round(cm.t_critical(4), 3), "t_df24": round(cm.t_critical(24), 3),
+         "per_case_half_n5": round(wide_half, 2),
+         "per_case_half_n25": round(narrow_half, 2),
+         "small_cells": [(r["org_code"], b["group_code"], b["cases"])
+                         for r in direct["orgs"] for b in r["group_breakdown"]
+                         if b["small_group"]],
+         "rare_breakdown_rows": len(rare_in_breakdown),
+         "matching_flags": flags}))
 
     passed = sum(1 for c in checks if c["passed"])
     return {"overall": passed == len(checks), "passed": passed,

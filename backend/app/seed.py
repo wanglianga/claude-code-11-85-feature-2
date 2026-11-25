@@ -19,6 +19,7 @@ from .models import (
     Case,
     CounterCheck,
     Delivery,
+    Episode,
     GraphEdge,
     GraphNode,
     IdentityEvidence,
@@ -601,6 +602,8 @@ def run_seed(reset: bool = True):
         seed_central(db)
         seed_referral(db)
         seed_pattern_configs(db)
+        from .seed_casemix import seed_casemix
+        seed_casemix(db)
         db.commit()
 
         # 1) 身份簇 v1
@@ -673,6 +676,7 @@ def run_seed(reset: bool = True):
         print(f"[seed] OK: {db.query(Person).count()} persons, "
               f"{db.query(SourceRecord).count()} source records, "
               f"{db.query(GraphNode).count()} nodes, {db.query(GraphEdge).count()} edges, "
+              f"{db.query(Episode).count()} casemix episodes, "
               f"snapshot #{snap.snapshot_no}, model_run #{model_run.id}")
     finally:
         db.close()

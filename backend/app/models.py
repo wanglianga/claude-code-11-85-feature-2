@@ -519,3 +519,75 @@ class ModelRun(Base):
     weights: Mapped[dict] = mapped_column(JSONB, default=dict)
     calibration: Mapped[dict] = mapped_column(JSONB, default=dict)
     note: Mapped[str] = mapped_column(Text)
+
+
+# ============================================================
+# 病例组合（Case-Mix）基准：结算行 → 就诊 episode → 分层/期望/残差
+#
+# 设计要点：
+# - ClaimLine 是逐行结算账（可多行），Episode 是一次就诊的汇总单元，
+#   金额由结算行汇总得到，并携带入院诊断、年龄、急诊/住院类型、手术复杂度
+#   与生效政策，保证“单看人均费用”之外可做病例结构调整。
+# - ClinicalGroup 是预先登记的临床分组（直接标准化口径），分组规则冻结、
+#   口径稳定；Episode.clinical_group_code 记录入组结果，未入组=未覆盖病例。
+# - 期望值与残差不落库，由 services/casemix.py 按两条路线实时计算，
+#   保证政策/分组口径变更后可复算；门禁结果随 episode 覆盖状态返回。
+# =================================================================
+class ClinicalGroup(Base):
+    """预先登记的临床分组（直接标准化的稳定口径）。"""
+    __tablename__ = "clinical_group"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    # 入组规则（冻结口径）：{diagnosis_prefixes, visit_types, surgery_levels, age_min?, age_max?}
+    rule: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # 小组判定阈值：组内可比病例数低于该值时只给宽区间并标注 small_group
+    min_group_n: Mapped[int] = mapped_column(Integer, default=30)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class Episode(Base):
+    """一次就诊 episode：由结算行汇总，关联诊断/年龄/就诊类型/手术复杂度/政策。"""
+    __tablename__ = "episode"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # EP-H1-001
+    org_code: Mapped[str] = mapped_column(String(32), index=True)
+    person_code: Mapped[str] = mapped_column(String(32), index=True)
+    episode_date: Mapped[datetime] = mapped_column(Date, index=True)
+    admission_diagnosis: Mapped[str] = mapped_column(String(64), index=True)
+    age: Mapped[int] = mapped_column(Integer)
+    # 住院 / 急诊 / 普通门诊
+    visit_kind: Mapped[str] = mapped_column(String(16), index=True)
+    # 手术复杂度：none / minor / moderate / major
+    surgery_level: Mapped[str] = mapped_column(String(16), index=True)
+    # 预登记临床分组入组结果；None 表示未覆盖（门禁不得外推）
+    clinical_group_code: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True)
+    # 生效政策（按 episode 日期命中的政策版本）
+    policy_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 服务量：结算行汇总得到的结算行数与服务单元数
+    line_count: Mapped[int] = mapped_column(Integer, default=1)
+    service_units: Mapped[float] = mapped_column(Float, default=1.0)
+    # 观察费用（结算行金额合计）
+    observed_amount: Mapped[float] = mapped_column(Numeric(14, 2))
+    source_id: Mapped[int] = mapped_column(ForeignKey("source_record.id"))
+    props: Mapped[dict] = mapped_column(JSONB, default=dict)
+    claim_lines: Mapped[list["ClaimLine"]] = relationship(
+        back_populates="episode", cascade="all, delete-orphan")
+
+
+class ClaimLine(Base):
+    """逐行结算账：多行汇总到同一就诊 episode。"""
+    __tablename__ = "claim_line"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    episode_id: Mapped[int] = mapped_column(ForeignKey("episode.id"), index=True)
+    line_no: Mapped[str] = mapped_column(String(64))
+    fee_item: Mapped[str] = mapped_column(String(128))
+    # 费用类别：医疗服务 / 检查检验 / 药品耗材 / 手术麻醉 / 床位护理
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    units: Mapped[float] = mapped_column(Float, default=1.0)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    source_id: Mapped[int] = mapped_column(ForeignKey("source_record.id"))
+    episode: Mapped[Episode] = relationship(back_populates="claim_lines")

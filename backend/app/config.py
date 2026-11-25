@@ -14,7 +14,7 @@ class Settings:
     DEFAULT_CUTOFF = os.getenv("DEFAULT_CUTOFF", "2026-03-31")
     TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "12"))
     # 前端构建产物（单镜像部署时由 FastAPI 托管）
-    STATIC_DIR = os.getenv("STATIC_DIR", "/workspace/85/frontend/dist")
+    STATIC_DIR = os.getenv("STATIC_DIR", "/workspace/85-feature-2/frontend/dist")
 
 
 settings = Settings()

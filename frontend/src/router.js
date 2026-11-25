@@ -12,6 +12,7 @@ const routes = [
       { path: 'identity', component: () => import('./pages/Identity.vue'), meta: { title: '身份解析' } },
       { path: 'explorer', component: () => import('./pages/Explorer.vue'), meta: { title: '受限图扩展' } },
       { path: 'patterns', component: () => import('./pages/Patterns.vue'), meta: { title: '模式与排序' } },
+      { path: 'casemix', component: () => import('./pages/CaseMix.vue'), meta: { title: '病例组合基准' } },
       { path: 'counter', component: () => import('./pages/Counter.vue'), meta: { title: '反证联查' } },
       { path: 'cases', component: () => import('./pages/Cases.vue'), meta: { title: '案件投影' } },
       { path: 'cases/:code', component: () => import('./pages/CaseDetail.vue'), meta: { title: '案件详情' } },
